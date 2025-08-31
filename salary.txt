@@ -1,0 +1,4 @@
+Salaries are structured in monthly and annual formats. 
+Monthly salary is the amount you receive every month. 
+Annual salary is calculated as monthly salary multiplied by 12. 
+Deductions such as tax and provident fund are subtracted from your salary.
