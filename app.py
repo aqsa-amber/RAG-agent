@@ -1,96 +1,96 @@
 import streamlit as st
 import os
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.vectorstores import FAISS
-from langchain.embeddings import SentenceTransformerEmbeddings
+from langchain_groq import ChatGroq
+from langchain.vectorstores import Chroma
 from langchain.chains import RetrievalQA
-from langchain.chat_models import GPT4All
-from langchain.prompts import PromptTemplate
+from langchain.document_loaders import TextLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings # <--- This is the new import
 
-# ------------------------------
-# Load Text Files
-# ------------------------------
-def load_text_files(data_dir="data"):
-    docs = []
-    for filename in os.listdir(data_dir):
-        if filename.endswith(".txt"):
-            with open(os.path.join(data_dir, filename), "r", encoding="utf-8") as f:
-                text = f.read()
-                docs.append({"filename": filename, "text": text})
-    return docs
+# --- 1. Get Groq API Key from Streamlit Secrets ---
+try:
+    groq_api_key = st.secrets["GROQ_API_KEY"]
+except KeyError:
+    st.error("GROQ_API_KEY not found in Streamlit secrets. Please check your .streamlit/secrets.toml file.")
+    st.stop()
 
-# ------------------------------
-# Create Vector Stores
-# ------------------------------
-def create_vectorstores(docs):
-    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-    stores = {}
-    for doc in docs:
-        splitter = CharacterTextSplitter(chunk_size=300, chunk_overlap=50)
-        chunks = splitter.split_text(doc["text"])
-        stores[doc["filename"].split(".")[0]] = FAISS.from_texts(chunks, embeddings)
-    return stores
-
-# ------------------------------
-# Initialize LLM
-# ------------------------------
-def init_llm(model_path="models/gpt4all-lora-quantized.bin"):
-    return GPT4All(model=model_path, n_ctx=512, backend="gptj")
-
-# ------------------------------
-# Create Agents
-# ------------------------------
-class Agent:
-    def __init__(self, name, vectorstore, llm):
-        self.name = name
-        self.qa = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=vectorstore.as_retriever(search_type="similarity", search_kwargs={"k":2}),
-            return_source_documents=False
-        )
-
-    def answer(self, query):
-        return self.qa.run(query)
-
-# ------------------------------
-# Coordinator Agent
-# ------------------------------
-class Coordinator:
-    def __init__(self, salary_agent, insurance_agent):
-        self.salary_agent = salary_agent
-        self.insurance_agent = insurance_agent
-
-    def route_query(self, query):
-        query_lower = query.lower()
-        if "salary" in query_lower or "pay" in query_lower or "deduction" in query_lower or "annual" in query_lower:
-            return self.salary_agent.answer(query)
-        elif "insurance" in query_lower or "premium" in query_lower or "claim" in query_lower or "coverage" in query_lower:
-            return self.insurance_agent.answer(query)
+# --- 2. Prepare Data and Vector Store (No OpenAI Key Needed) ---
+@st.cache_resource
+def setup_vector_store():
+    """Loads documents and creates a vector store."""
+    data_files = ['salary.txt', 'insurance.txt']
+    documents = []
+    for file in data_files:
+        if os.path.exists(file):
+            loader = TextLoader(file)
+            documents.extend(loader.load())
         else:
-            return "Sorry, I can only answer salary or insurance questions."
+            st.error(f"Required file not found: {file}")
+            st.stop()
 
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-st.set_page_config(page_title="Multi-Agent RAG System Offline", layout="wide")
-st.title("💬 Multi-Agent RAG Chatbot (Offline)")
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+    texts = text_splitter.split_documents(documents)
+    
+    # Use HuggingFaceEmbeddings to run a local model
+    # This does not require any API key
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-# Load data & vectorstores
-docs = load_text_files("data")
-vectorstores = create_vectorstores(docs)
+    vectordb = Chroma.from_documents(texts, embeddings, persist_directory="./chroma_db")
+    vectordb.persist()
+    return vectordb
 
-# Initialize local LLM
-llm = init_llm()
+vectordb = setup_vector_store()
 
-# Create agents
-salary_agent = Agent("Salary Agent", vectorstores["salary"], llm)
-insurance_agent = Agent("Insurance Agent", vectorstores["insurance"], llm)
-coordinator = Coordinator(salary_agent, insurance_agent)
+# --- 3. Define Agents ---
+@st.cache_resource
+def setup_agents(llm_model):
+    """Sets up the retrieval agents with the language model."""
+    llm = ChatGroq(groq_api_key=groq_api_key, model_name=llm_model)
 
-# User query
-query = st.text_input("Ask a question about salary or insurance:")
+    salary_agent = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=vectordb.as_retriever(),
+    )
 
-if query:
-    with st.spinner("Thinking..."):
-        response = coordinator.route_query(query)
-    st.markdown(f"**Answer:** {response}")
+    insurance_agent = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=vectordb.as_retriever(),
+    )
+    return salary_agent, insurance_agent
+
+# Use the 'mixtral-8x7b-32768' model for fast and high-quality responses
+salary_agent, insurance_agent = setup_agents("llama3-8b-8192")
+
+# --- 4. Coordinator Agent Logic ---
+def coordinator_agent(query):
+    """Routes the query to the correct agent based on keywords."""
+    query_lower = query.lower()
+    if "salary" in query_lower or "deduction" in query_lower or "income" in query_lower:
+        st.info("Routing query to Salary Agent...")
+        return salary_agent.run(query)
+    elif "insurance" in query_lower or "policy" in query_lower or "coverage" in query_lower:
+        st.info("Routing query to Insurance Agent...")
+        return insurance_agent.run(query)
+    else:
+        return "I'm sorry, I can only answer questions about salary or insurance."
+
+# --- 5. Streamlit App UI ---
+st.title("Multi-Agent RAG System with Groq (Local Embeddings)")
+st.write("Ask a question about your salary or insurance.")
+
+query_input = st.text_input("Enter your query:")
+
+if st.button("Submit"):
+    if query_input:
+        with st.spinner("Processing..."):
+            try:
+                response = coordinator_agent(query_input)
+                st.success("Here's your answer:")
+                st.write(response)
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+    else:
+        st.warning("Please enter a query.")
+
